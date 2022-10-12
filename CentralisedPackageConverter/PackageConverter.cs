@@ -1,6 +1,9 @@
 ﻿using System;
+using System.ComponentModel.DataAnnotations;
 using System.IO;
+using System.Linq;
 using System.Xml.Linq;
+using System.Xml.Serialization;
 
 namespace CentralisedPackageConverter;
 
@@ -61,7 +64,13 @@ public class PackageConverter
         }
         else
         {
-            projects.ForEach(proj => ConvertProject(proj, dryRun));
+            ConvertFromPaketDependenciesFile(rootDir, dryRun);
+
+            foreach (var proj in projects.Where(p => File.Exists(p.FullName)))
+            {
+                ConvertProject(proj, dryRun);
+                ConvertFromPaketReferenceFiles(proj, dryRun);
+            }
 
             if (allReferences.Any())
             {
@@ -139,7 +148,10 @@ public class PackageConverter
         lines.Add("  </PropertyGroup>");
         lines.Add("  <ItemGroup>");
 
-        foreach (var kvp in allReferences.OrderBy(x => x.Key))
+        // Implicit references will cause build error NU1009 with nuget CPM, so skip them
+        var implicitReferences = new string[] { "NETStandard.Library" }.ToHashSet();
+
+        foreach (var kvp in allReferences.Where(r => !implicitReferences.Contains(r.Key)).OrderBy(x => x.Key))
         {
             lines.Add($"    <PackageVersion Include=\"{kvp.Key}\" Version=\"{kvp.Value}\" />");
         }
@@ -240,5 +252,154 @@ public class PackageConverter
         if (needToWriteChanges && !dryRun)
             xml.Save(csprojFile.FullName);
     }
-}
 
+    private void ConvertFromPaketDependenciesFile(DirectoryInfo directory, bool dryRun)
+    {
+        var packagesDirectory = Path.Combine(directory.FullName, "packages");
+        var paketDirectory = Path.Combine(directory.FullName, ".paket");
+        var paketFilesDirectory = Path.Combine(directory.FullName, "paket-files");
+        var paketDependenciesFile = Path.Combine(directory.FullName, "paket.dependencies");
+        var paketLockFile = Path.Combine(directory.FullName, "paket.lock");
+
+        var dependenciesVersions = File // These are the package names we want to transfer to Directory.Build.props
+            .ReadAllLines(paketDependenciesFile)
+            .Where(l => l.StartsWith("nuget"))
+            .Select(l => l.Split()[1]); // l[0] nuget l[1] Name l[2 - ∞] metadata
+        var lockVersions = File // This is where we find the actual version numbers
+            .ReadAllLines(paketLockFile)
+            .Where(l => l.StartsWith("    ")) // Lines starting with 4 space indents are the base packages
+            .Select(l => l.Remove(0, 4))
+            .Where(l => !l.StartsWith(" ")) // If there are still lines starting with spaces they are transitive packages, dump them
+            .Select(l => l.Split(" "))
+            .ToDictionary(l => l[0], l => l[1].Trim('(', ')'), StringComparer.OrdinalIgnoreCase); // l[0] Name l[1] Version l[2 - ∞] metadata
+
+        foreach (var d in dependenciesVersions)
+            allReferences.TryAdd(d, lockVersions[d]);
+        foreach (var d in lockVersions)
+            allReferences.TryAdd(d.Key, d.Value);
+
+        if (!dryRun)
+        {
+            if (Directory.Exists(packagesDirectory))
+                Directory.Delete(packagesDirectory, true);
+            else
+                Console.WriteLine("Packages directory not found, you must delete it manually.");
+            if (Directory.Exists(paketDirectory))
+                Directory.Delete(paketDirectory, true);
+            if (Directory.Exists(paketFilesDirectory))
+                Directory.Delete(paketFilesDirectory, true);
+            if (File.Exists(paketDependenciesFile))
+                File.Delete(paketDependenciesFile);
+            if (File.Exists(paketLockFile))
+                File.Delete(paketLockFile);
+        }
+    }
+
+    private void ConvertFromPaketReferenceFiles(FileInfo csprojFile, bool dryRun)
+    {
+        var paketFile = Path.Combine(csprojFile.Directory.FullName, "paket.references");
+
+        if (File.Exists(paketFile))
+        {
+            var xml = XDocument.Load(csprojFile.FullName);
+            //var xml = XDocument.Load(csprojFile.FullName, LoadOptions.PreserveWhitespace);
+            var @namespace = xml.Descendants().First(d => d.Name.LocalName == "Project").Name.Namespace;
+            var paketReferences = File.ReadLines(paketFile);
+
+            if (paketReferences.Any())
+            {
+                // Find or create ItemGroup with PackageReferences
+                var packageReferences = xml
+                    .Descendants()
+                    .Where(d => d.Name.LocalName == "PackageReference")
+                    .FirstOrDefault()
+                    ?.Parent;
+
+                if (packageReferences == null)
+                {
+                    packageReferences = new XElement(@namespace + "ItemGroup");
+                    // Now we need to put the ItemGroup somewhere smart
+                    var targetPosition = xml
+                        .Descendants()
+                        .Where(d => d.Name.LocalName == "ProjectReference")
+                        .FirstOrDefault()
+                        ?.Parent; // VS puts it here
+
+                    if (targetPosition != null)
+                    {
+                        targetPosition.AddBeforeSelf(packageReferences);
+                    }
+                    else
+                    {
+                        targetPosition =
+                            xml
+                                .Descendants()
+                                .Where(d => d.Name.LocalName == "PropertyGroup")
+                                .LastOrDefault() ?? // Put our packages after the last ItemGroup
+                            xml.Descendants().Last(); // Dump it at the end of the file if everything else fails
+                        targetPosition.AddAfterSelf(packageReferences);
+                    }
+                }
+
+                // Add PackageReference items from paket
+                foreach (var reference in paketReferences.Where(r => !string.IsNullOrEmpty(r)))
+                {
+                    var line = reference.Split("#"); // line[0] reference line[1] comment
+
+                    if (line.Length > 1 && !string.IsNullOrEmpty(line[1]))
+                        packageReferences.Add(new XComment(line[1]));
+                    if (!string.IsNullOrEmpty(line[0]))
+                    {
+                        var package = line[0].Split(" "); // package[0] package name package[1 - ∞] metadata
+                        packageReferences.Add(new XElement(@namespace + "PackageReference", new XAttribute("Include", package[0])));
+                    }
+
+                    //allReferences.TryAdd("", "");
+                }
+            }
+
+            // Remove Import paket from csproj
+            foreach (var e in xml.Descendants("Import").Where(e => e.Attribute("Project").Value.Contains(".paket")).ToArray())
+            {
+                if (!dryRun)
+                    e.Remove();
+            }
+
+            // Remove paket generated bindings from web/app config
+            var configs = Directory
+                .GetFiles(csprojFile.Directory.FullName)
+                .Where(f => f.EndsWith(".config"))
+                .Where(f => f.Contains("app.", StringComparison.OrdinalIgnoreCase) || f.Contains("web.", StringComparison.OrdinalIgnoreCase));
+            foreach (var config in configs)
+            {
+                var xmlConfig = XDocument.Load(config);
+
+                var test = xmlConfig.Descendants().Reverse().Take(10).ToArray();
+                var dependentAssemblies = xmlConfig
+                    .Descendants("{urn:schemas-microsoft-com:asm.v1}dependentAssembly")
+                    // Only get nodes generated by Paket
+                    .Where(da => da.Descendants("{urn:schemas-microsoft-com:asm.v1}Paket").Select(p => p.Value).All(v => v == "True"))
+                    .ToArray();
+
+                var dependentAssembliesParent = dependentAssemblies.FirstOrDefault()?.Parent;
+                dependentAssemblies.Remove();
+                if (dependentAssembliesParent?.HasElements == false)
+                {
+                    dependentAssembliesParent?.Parent.Remove();
+                }
+
+                xmlConfig.Save(config);
+            }
+
+            if (dryRun)
+            {
+                Console.WriteLine("Deleting " + paketFile);
+            }
+            else
+            {
+                xml.Save(csprojFile.FullName);
+                File.Delete(paketFile);
+            }
+        }
+    }
+}
